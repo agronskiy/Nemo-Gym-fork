@@ -1,0 +1,25 @@
+openenv_snake_resources_server:
+  resources_servers:
+    openenv:
+      entrypoint: app.py
+      domain: games
+      verified: false
+      description: "Snake game environment via OpenEnv. Agent controls a snake to eat fruits."
+      env_class: "snake_env.server.snake_environment.SnakeEnvironment"
+      action_class: "snake_env.models.SnakeAction"
+      is_mcp: false
+
+openenv_snake_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: openenv_snake_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/openenv/data/snake/example.jsonl

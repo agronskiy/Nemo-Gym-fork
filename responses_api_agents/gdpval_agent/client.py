@@ -50,6 +50,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "run_command",
+        "strict": True,
         "description": "Execute a bash command in the sandbox environment.",
         "parameters": {
             "type": "object",
@@ -69,6 +70,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "finish",
+        "strict": True,
         "description": (
             "Mark the task as complete and end the session. "
             "Optionally provide a list of file paths (relative to the sandbox working directory) "

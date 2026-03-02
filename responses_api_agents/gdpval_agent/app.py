@@ -464,9 +464,21 @@ class GDPValAgent(SimpleResponsesAPIAgent):
         # For now call /verify as a placeholder — the bash_sandbox verify
         # returns reward=1.0 unconditionally.
         verify_request = {
+            "responses_create_params": body.responses_create_params.model_dump(),
+            "response": {
+                "id": "placeholder",
+                "created_at": 0,
+                "model": "placeholder",
+                "object": "response",
+                "output": response_json.get("output", []),
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
             "task_id": body.task_id,
             "output_files": [f.model_dump() for f in saved_files],
-            "response": response_json,
+            "session_id": body.session_id or "",
+            "paths": [f.output_path for f in saved_files],
         }
 
         verify_response = await self.server_client.post(

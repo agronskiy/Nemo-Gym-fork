@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import logging
+
 import anyio
 import re
 import shutil
@@ -32,6 +35,8 @@ from nemo_gym.base_resources_server import (
     BaseSeedSessionRequest,
     BaseSeedSessionResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 SHELL_TIMEOUT = 30
 
@@ -82,9 +87,28 @@ class SavedFile(BaseModel):
     output_path: Path  # Path where file was saved
     size: int
 
+class CommitteeModelConfig(BaseModel):
+    name: str
+    elo: float
+    output_dir: str
+
+
+class JudgeConfig(BaseModel):
+    enabled: bool = False
+    judge_model_name: str = "gemini-3-pro-preview"
+    gcp_project_id: str = ""
+    gcp_location: str = "global"
+    thinking_budget: int = 5000
+    max_output_tokens: int = 65535
+    num_trials: int = 4
+    max_concurrent_judgements: int = 10
+    committee_models: List[CommitteeModelConfig] = Field(default_factory=list)
+
+
 class BashSandboxResourcesServerConfig(BaseResourcesServerConfig):
     temp_dir_base: Path = Field(default_factory=lambda: Path("/tmp/nemo_gym_bash_sandboxes"))
     allowlist: List[str] = Field(default_factory=list)
+    judge: JudgeConfig = Field(default_factory=JudgeConfig)
 
 class SeedSessionRequest(BaseSeedSessionRequest):
     session_id: str | None = None
@@ -139,12 +163,31 @@ class FinishResponse(BaseModel):
 class VerifyRequest(BaseVerifyRequest):
     session_id: str
     paths: List[str]
+    task_id: str = ""
+    task_prompt: str = ""
+
+
+class CommitteeModelVerdict(BaseModel):
+    committee_model_name: str
+    committee_model_elo: float
+    win_count_evaluated: int
+    win_count_committee: int
+    tie_count: int
+    num_trials: int
+    reward: float
+    success: bool
+    error_message: str | None = None
+
+
+class GDPValVerifyResponse(BaseVerifyResponse):
+    committee_verdicts: List[CommitteeModelVerdict] = Field(default_factory=list)
 
 class BashSandboxResourcesServer(SimpleResourcesServer):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     config: BashSandboxResourcesServerConfig
     session_manager: SessionManager = None  # type: ignore[assignment]
+    _judge: object = None  # Lazily initialized GDPValJudge
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -536,9 +579,135 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             error_message=result.error_message,
         )
 
+    def _get_or_create_judge(self):
+        """Lazily initialize the GDPValJudge on first verify call."""
+        if self._judge is None:
+            from resources_servers.bash_sandbox.judge import GDPValJudge
+
+            judge_config = self.config.judge
+            self._judge = GDPValJudge(
+                gcp_project_id=judge_config.gcp_project_id,
+                gcp_location=judge_config.gcp_location,
+                judge_model_name=judge_config.judge_model_name,
+                thinking_budget=judge_config.thinking_budget,
+                max_output_tokens=judge_config.max_output_tokens,
+                num_trials=judge_config.num_trials,
+                max_concurrent_judgements=judge_config.max_concurrent_judgements,
+            )
+        return self._judge
+
     async def verify(self, body: VerifyRequest) -> BaseVerifyResponse:
-        #TODO: Do some verification on task output files here.
-        return BaseVerifyResponse(**body.model_dump(), reward=1.0)
+        judge_config = self.config.judge
+
+        # Backward compatible: if judge not enabled or no committee models, return reward=1.0
+        if not judge_config.enabled or not judge_config.committee_models:
+            return GDPValVerifyResponse(**body.model_dump(), reward=1.0)
+
+        judge = self._get_or_create_judge()
+
+        # Determine evaluated output dir from the first saved file path
+        if body.paths:
+            evaluated_output_dir = str(Path(body.paths[0]).parent)
+        else:
+            logger.warning("No output paths in verify request, returning reward=1.0")
+            return GDPValVerifyResponse(**body.model_dump(), reward=1.0)
+
+        # Find reference files directory: check if reference_files/ exists in evaluated output
+        refs_dir = None
+        evaluated_refs = Path(evaluated_output_dir) / "reference_files"
+        if evaluated_refs.exists() and any(evaluated_refs.iterdir()):
+            refs_dir = str(evaluated_refs)
+
+        # Build judge tasks for each committee model
+        judge_tasks = []
+        committee_configs = []
+        for cm in judge_config.committee_models:
+            cm_task_dir = Path(cm.output_dir) / f"task_{body.task_id}"
+            finish_params = cm_task_dir / "finish_params.json"
+
+            # H7: Skip committee models that didn't attempt this task
+            if not cm_task_dir.exists() or not finish_params.exists():
+                logger.warning(
+                    "Committee model %s has no output for task %s, skipping",
+                    cm.name, body.task_id,
+                )
+                continue
+
+            # Check for reference files in committee dir too (H1)
+            if refs_dir is None:
+                cm_refs = cm_task_dir / "reference_files"
+                if cm_refs.exists() and any(cm_refs.iterdir()):
+                    refs_dir = str(cm_refs)
+
+            judge_tasks.append(
+                judge.judge_task(
+                    task_prompt=body.task_prompt,
+                    evaluated_output_dir=evaluated_output_dir,
+                    committee_output_dir=str(cm_task_dir),
+                    refs_dir=refs_dir,
+                    committee_model_name=cm.name,
+                    committee_model_elo=cm.elo,
+                )
+            )
+            committee_configs.append(cm)
+
+        # H7: If no committee models have output for this task, fall back to reward=1.0
+        if not judge_tasks:
+            logger.warning("No committee models have output for task %s, returning reward=1.0", body.task_id)
+            return GDPValVerifyResponse(**body.model_dump(), reward=1.0)
+
+        # Run all judge tasks concurrently
+        results = await asyncio.gather(*judge_tasks, return_exceptions=True)
+
+        # Build verdicts and compute mean reward
+        committee_verdicts = []
+        successful_rewards = []
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error("Judge task for %s raised exception: %s", committee_configs[i].name, result)
+                committee_verdicts.append(CommitteeModelVerdict(
+                    committee_model_name=committee_configs[i].name,
+                    committee_model_elo=committee_configs[i].elo,
+                    win_count_evaluated=0,
+                    win_count_committee=0,
+                    tie_count=0,
+                    num_trials=0,
+                    reward=0.0,
+                    success=False,
+                    error_message=str(result),
+                ))
+                continue
+
+            verdict = CommitteeModelVerdict(
+                committee_model_name=result.committee_model_name,
+                committee_model_elo=result.committee_model_elo,
+                win_count_evaluated=result.win_count_evaluated,
+                win_count_committee=result.win_count_committee,
+                tie_count=result.tie_count,
+                num_trials=result.num_trials,
+                reward=result.reward,
+                success=result.success,
+                error_message=result.error_message,
+            )
+            committee_verdicts.append(verdict)
+
+            # H6: Only include successful verdicts in the mean
+            if result.success:
+                successful_rewards.append(result.reward)
+
+        # H6: If ALL verdicts fail, fall back to reward=1.0
+        if not successful_rewards:
+            logger.warning("All committee verdicts failed for task %s, returning reward=1.0", body.task_id)
+            mean_reward = 1.0
+        else:
+            mean_reward = sum(successful_rewards) / len(successful_rewards)
+
+        return GDPValVerifyResponse(
+            **body.model_dump(),
+            reward=mean_reward,
+            committee_verdicts=committee_verdicts,
+        )
 
 if __name__ == "__main__":
     BashSandboxResourcesServer.run_webserver()

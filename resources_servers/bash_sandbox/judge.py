@@ -34,7 +34,7 @@ import shutil
 import tempfile
 import threading
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from google import genai
@@ -75,6 +75,7 @@ _VERDICT_PATTERN = re.compile(r"BOXED\[(A|B|TIE)\]")
 
 # --- File handling utilities ---
 
+
 def convert_to_pdf(path):
     """Return PDF bytes if a pre-converted PDF exists next to the file, else None."""
     input_path = Path(path).resolve()
@@ -110,11 +111,7 @@ def maybe_unzip(path, extract_dir):
         with zipfile.ZipFile(path, "r") as zip_ref:
             members = zip_ref.namelist()
             zip_ref.extractall(extract_dir)
-            extracted_paths = [
-                Path(extract_dir) / Path(member)
-                for member in members
-                if member
-            ]
+            extracted_paths = [Path(extract_dir) / Path(member) for member in members if member]
     except (zipfile.BadZipFile, zipfile.LargeZipFile, FileNotFoundError):
         pass
     return extracted_paths
@@ -167,6 +164,7 @@ FILE_TYPE_MAP = {
 
 # --- Result dataclass ---
 
+
 @dataclass
 class JudgementResult:
     """Result of judging one task against one committee model.
@@ -178,6 +176,7 @@ class JudgementResult:
       B_WIN → evaluated wins → increment win_count_evaluated
       When swapped: logic inverts.
     """
+
     committee_model_name: str
     win_count_evaluated: int = 0
     win_count_committee: int = 0
@@ -216,6 +215,7 @@ class JudgementResult:
 
 
 # --- Judge class ---
+
 
 class GDPValJudge:
     """Async LLM-as-judge for pairwise comparison using Gemini via VertexAI.
@@ -305,9 +305,7 @@ class GDPValJudge:
                 return types.Part.from_bytes(data=media_bytes, mime_type=file_mime_type)
 
         except Exception as e:
-            raise RuntimeError(
-                f"Error getting file: {file_name} in directory: {file_dir}: {e}"
-            ) from e
+            raise RuntimeError(f"Error getting file: {file_name} in directory: {file_dir}: {e}") from e
 
         return None
 
@@ -366,9 +364,7 @@ class GDPValJudge:
     ) -> list[types.Content]:
         """Construct the judge prompt message from parts."""
         parts = []
-        parts.append(types.Part.from_text(
-            text=JUDGE_PROMPT + TASK_TEMPLATE.format(task=task_prompt)
-        ))
+        parts.append(types.Part.from_text(text=JUDGE_PROMPT + TASK_TEMPLATE.format(task=task_prompt)))
         parts.append(types.Part.from_text(text=REFERENCES_OPEN))
         parts.extend(refs)
         parts.append(types.Part.from_text(text=REFERENCES_CLOSE))
@@ -474,15 +470,9 @@ class GDPValJudge:
                 os.makedirs(refs_extract_dir, exist_ok=True)
 
                 refs_section, committee_section, evaluated_section = await asyncio.gather(
-                    loop.run_in_executor(
-                        None, self._build_file_section, refs_dir, refs_extract_dir
-                    ),
-                    loop.run_in_executor(
-                        None, self._build_file_section, committee_output_dir, committee_extract_dir
-                    ),
-                    loop.run_in_executor(
-                        None, self._build_file_section, evaluated_output_dir, evaluated_extract_dir
-                    ),
+                    loop.run_in_executor(None, self._build_file_section, refs_dir, refs_extract_dir),
+                    loop.run_in_executor(None, self._build_file_section, committee_output_dir, committee_extract_dir),
+                    loop.run_in_executor(None, self._build_file_section, evaluated_output_dir, evaluated_extract_dir),
                 )
 
                 # Run trials with position swapping
@@ -510,7 +500,8 @@ class GDPValJudge:
                     if response_text is None:
                         logger.warning(
                             "All retries exhausted for trial %d of task (committee=%s)",
-                            i, committee_model_name,
+                            i,
+                            committee_model_name,
                         )
                         continue
 
@@ -518,7 +509,8 @@ class GDPValJudge:
                     if verdict is None:
                         logger.warning(
                             "No recognized verdict in trial %d response (committee=%s), skipping trial",
-                            i, committee_model_name,
+                            i,
+                            committee_model_name,
                         )
                         continue
 
@@ -530,7 +522,8 @@ class GDPValJudge:
                 result.error_message = str(e)
                 logger.error(
                     "Error judging task (committee=%s): %s",
-                    committee_model_name, e,
+                    committee_model_name,
+                    e,
                 )
 
             finally:
@@ -556,10 +549,12 @@ class GDPValJudge:
                 if attempt == max_retries - 1:
                     logger.error("Send failed after %d attempts: %s", max_retries, e)
                     return None
-                wait_time = 2 ** attempt
+                wait_time = 2**attempt
                 logger.warning(
                     "Send attempt %d failed (%s), retrying in %ds...",
-                    attempt + 1, e, wait_time,
+                    attempt + 1,
+                    e,
+                    wait_time,
                 )
                 await asyncio.sleep(wait_time)
         return None

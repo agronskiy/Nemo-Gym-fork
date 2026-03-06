@@ -191,16 +191,6 @@ dependencies = [
     # Updated: Mon Mar 03, 2026
     # License: Apache 2.0 https://github.com/googleapis/python-genai/blob/main/LICENSE
     "google-genai",
-
-    # httpx: Async HTTP client used by bash_sandbox web_search and web_fetch tools
-    # Updated: Tue Mar 04, 2026
-    # License: BSD 3-Clause https://github.com/encode/httpx/blob/master/LICENSE.md
-    "httpx",
-
-    # trafilatura: Web content extraction used by bash_sandbox web_fetch tool
-    # Updated: Tue Mar 04, 2026
-    # License: Apache 2.0 https://github.com/adbar/trafilatura/blob/master/LICENSE
-    "trafilatura",
 ]
 
 [dependency-groups]
@@ -218,6 +208,24 @@ docs = [
 ]
 
 [project.optional-dependencies]
+# bash-sandbox: Dependencies required only by resources_servers/bash_sandbox/app.py.
+bash-sandbox = [
+    # httpx: Async HTTP client used by bash_sandbox web_search and web_fetch tools
+    # Updated: Tue Mar 04, 2026
+    # License: BSD 3-Clause https://github.com/encode/httpx/blob/master/LICENSE.md
+    "httpx",
+
+    # trafilatura: Web content extraction used by bash_sandbox web_fetch tool
+    # Updated: Tue Mar 04, 2026
+    # License: Apache 2.0 https://github.com/adbar/trafilatura/blob/master/LICENSE
+    "trafilatura",
+
+    # tavily-python: Used for web search in resources_servers/bash_sandbox/app.py.
+    # Updated: 2026-03-06 with tavily-python==0.7.22
+    # License: MIT https://github.com/tavily-ai/tavily-python/blob/main/LICENSE
+    "tavily-python>=0.7.22",
+]
+
 # We include dev dependencies as an extra since technically each server module is a consumer (which means we cannot use dependency groups, which are intended to be within a project).
 dev = [
     # Pre-commit: Used for pre-commit hooks.

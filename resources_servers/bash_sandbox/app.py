@@ -15,29 +15,29 @@
 import asyncio
 import logging
 import os
-from html import escape
-
-import anyio
 import re
 import shutil
 import subprocess
 import tempfile
 import uuid
-
-from typing import Dict, List
-from fastapi import FastAPI
+from html import escape
 from pathlib import Path
+from typing import Dict, List
+
+import anyio
+from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 from tavily import TavilyClient
 
 from nemo_gym.base_resources_server import (
-    SimpleResourcesServer,
     BaseResourcesServerConfig,
-    BaseVerifyRequest,
-    BaseVerifyResponse,
     BaseSeedSessionRequest,
     BaseSeedSessionResponse,
+    BaseVerifyRequest,
+    BaseVerifyResponse,
+    SimpleResourcesServer,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,10 @@ MAX_LENGTH_WEB_FETCH = 40000
 WEB_REQUEST_TIMEOUT = 60 * 3
 TAVILY_MAX_RESULTS = 5
 
+
 class Session(BaseModel):
     """All code execution and file access happens in the temp directory."""
+
     temp_dir: Path
 
     @classmethod
@@ -56,12 +58,14 @@ class Session(BaseModel):
         temp_dir = Path(tempfile.mkdtemp(prefix="local_sandbox_", dir=temp_dir_base))
         return cls(temp_dir=temp_dir)
 
+
 class SessionManager:
     """
     In-memory session store. For multiple workers, the agent must use session affinity
     (worker_urls in config + affinity_key=session_id) so all requests for a session
     hit the same worker.
     """
+
     id_to_session: Dict[str, Session]
     temp_dir_base: Path
 
@@ -86,17 +90,22 @@ class SessionManager:
         if session:
             shutil.rmtree(session.temp_dir)
 
+
 class UploadedFile(BaseModel):
     """Information about a file uploaded to the execution environment."""
+
     source_path: Path  # Original path on local filesystem
     dest_path: str  # Path in the execution environment
     size: int
 
+
 class SavedFile(BaseModel):
     """Information about a file saved from the execution environment."""
+
     source_path: str  # Original path in execution environment
     output_path: Path  # Path where file was saved
     size: int
+
 
 class CommitteeModelConfig(BaseModel):
     name: str
@@ -120,18 +129,22 @@ class BashSandboxResourcesServerConfig(BaseResourcesServerConfig):
     allowlist: List[str] = Field(default_factory=list)
     judge: JudgeConfig = Field(default_factory=JudgeConfig)
 
+
 class SeedSessionRequest(BaseSeedSessionRequest):
     session_id: str | None = None
+
 
 class SeedSessionResponse(BaseSeedSessionResponse):
     session_id: str
     success: bool
     error_message: str | None = None
 
+
 class RunCommandRequest(BaseModel):
     command: str
     session_id: str
     timeout: int = SHELL_TIMEOUT
+
 
 class RunCommandResponse(BaseModel):
     exit_code: int
@@ -139,30 +152,36 @@ class RunCommandResponse(BaseModel):
     stderr: str
     error_kind: str | None = None
     advice: str | None = None
-    
-class UploadFilesRequest(BaseModel): 
+
+
+class UploadFilesRequest(BaseModel):
     paths: List[str]
     session_id: str
     dest_dir: str | None = None
 
+
 class UploadFilesResponse(BaseModel):
     uploaded: List[UploadedFile]
     failed: Dict[str, str]
+
 
 class SaveOutputFilesRequest(BaseModel):
     paths: List[str]
     session_id: str
     output_dir: str
 
+
 class SaveOutputFilesResponse(BaseModel):
     saved: List[SavedFile]
     failed: Dict[str, str]
     error_message: str | None = None
 
+
 class FinishRequest(BaseModel):
     session_id: str
     paths: List[str] | None = None
     output_dir: str | None = None
+
 
 class FinishResponse(BaseModel):
     session_deleted: bool
@@ -170,21 +189,26 @@ class FinishResponse(BaseModel):
     failed: Dict[str, str] = Field(default_factory=dict)
     error_message: str | None = None
 
+
 class WebSearchRequest(BaseModel):
     query: str
     session_id: str
+
 
 class WebSearchResponse(BaseModel):
     results_xml: str
     error: str | None = None
 
+
 class WebFetchRequest(BaseModel):
     url: str
     session_id: str
 
+
 class WebFetchResponse(BaseModel):
     content: str
     error: str | None = None
+
 
 class VerifyRequest(BaseVerifyRequest):
     session_id: str
@@ -206,6 +230,7 @@ class CommitteeModelVerdict(BaseModel):
 
 class GDPValVerifyResponse(BaseVerifyResponse):
     committee_verdicts: List[CommitteeModelVerdict] = Field(default_factory=list)
+
 
 class BashSandboxResourcesServer(SimpleResourcesServer):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -308,8 +333,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                     exit_code=1,
                     stdout="",
                     stderr=(
-                        "Command may access paths outside the session directory. This is not allowed. "
-                        + session_msg
+                        "Command may access paths outside the session directory. This is not allowed. " + session_msg
                     ),
                     error_kind="absolute_path_detected",
                     advice=session_msg,
@@ -320,7 +344,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             path = match.group(1)
             if path.startswith(session_dir):
                 continue
-            if "://" in cmd[max(0, match.start(1) - 8):match.start(1)]:
+            if "://" in cmd[max(0, match.start(1) - 8) : match.start(1)]:
                 continue
             return RunCommandResponse(
                 exit_code=1,
@@ -534,7 +558,9 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             SaveOutputFilesResponse containing lists of saved files and any failures.
 
         """
-        print(f"save_output_files: session_id: {body.session_id}, session_manager: {self.session_manager.id_to_session}")
+        print(
+            f"save_output_files: session_id: {body.session_id}, session_manager: {self.session_manager.id_to_session}"
+        )
         try:
             session = self.session_manager.get_session(body.session_id)
         except Exception as e:
@@ -600,11 +626,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         print(f"finish: session_id: {body.session_id}, session_manager: {self.session_manager.id_to_session}")
         if body.paths is not None and body.output_dir is not None:
             result = await self.save_output_files(
-                SaveOutputFilesRequest(
-                    paths=body.paths,
-                    session_id=body.session_id,
-                    output_dir=body.output_dir
-                )
+                SaveOutputFilesRequest(paths=body.paths, session_id=body.session_id, output_dir=body.output_dir)
             )
         else:
             result = SaveOutputFilesResponse(saved=[], failed={})
@@ -621,7 +643,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                 failed=result.failed,
                 error_message="; ".join(errors),
             )
-        
+
         return FinishResponse(
             session_deleted=True,
             saved=result.saved,
@@ -647,7 +669,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             except (asyncio.TimeoutError, OSError, ConnectionError) as exc:
                 last_exc = exc
                 if attempt < max_attempts - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2**attempt)
         raise last_exc  # type: ignore[misc]
 
     async def web_search(self, body: WebSearchRequest) -> WebSearchResponse:
@@ -690,28 +712,22 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         try:
             client = self._get_tavily_client()
         except ValueError as exc:
-            content = (
-                f"<web_fetch><url>{escape(body.url)}</url>"
-                f"<error>{escape(str(exc))}</error></web_fetch>"
-            )
+            content = f"<web_fetch><url>{escape(body.url)}</url><error>{escape(str(exc))}</error></web_fetch>"
             return WebFetchResponse(content=content, error=str(exc))
 
         try:
             data = await self._tavily_call_with_retry(
-                client.extract, urls=[body.url],
+                client.extract,
+                urls=[body.url],
             )
             extracted = data.get("results", [])
             body_text = extracted[0].get("raw_content", "") if extracted else ""
             content = (
-                f"<web_fetch><url>{escape(body.url)}</url>"
-                f"<body>{body_text[:MAX_LENGTH_WEB_FETCH]}</body></web_fetch>"
+                f"<web_fetch><url>{escape(body.url)}</url><body>{body_text[:MAX_LENGTH_WEB_FETCH]}</body></web_fetch>"
             )
             return WebFetchResponse(content=content)
         except Exception as exc:
-            content = (
-                f"<web_fetch><url>{escape(body.url)}</url>"
-                f"<error>{escape(str(exc))}</error></web_fetch>"
-            )
+            content = f"<web_fetch><url>{escape(body.url)}</url><error>{escape(str(exc))}</error></web_fetch>"
             return WebFetchResponse(content=content, error=str(exc))
 
     def _get_or_create_judge(self):
@@ -764,7 +780,8 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             if not cm_task_dir.exists() or not finish_params.exists():
                 logger.warning(
                     "Committee model %s has no output for task %s, skipping",
-                    cm.name, body.task_id,
+                    cm.name,
+                    body.task_id,
                 )
                 continue
 
@@ -800,16 +817,18 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error("Judge task for %s raised exception: %s", committee_configs[i].name, result)
-                committee_verdicts.append(CommitteeModelVerdict(
-                    committee_model_name=committee_configs[i].name,
-                    win_count_evaluated=0,
-                    win_count_committee=0,
-                    tie_count=0,
-                    num_trials=0,
-                    reward=0.0,
-                    success=False,
-                    error_message=str(result),
-                ))
+                committee_verdicts.append(
+                    CommitteeModelVerdict(
+                        committee_model_name=committee_configs[i].name,
+                        win_count_evaluated=0,
+                        win_count_committee=0,
+                        tie_count=0,
+                        num_trials=0,
+                        reward=0.0,
+                        success=False,
+                        error_message=str(result),
+                    )
+                )
                 continue
 
             verdict = CommitteeModelVerdict(
@@ -840,6 +859,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             reward=mean_reward,
             committee_verdicts=committee_verdicts,
         )
+
 
 if __name__ == "__main__":
     BashSandboxResourcesServer.run_webserver()

@@ -3,18 +3,17 @@ bash_sandbox_resources_server:
     bash_sandbox:
       entrypoint: app.py
       domain: agent
-      # For multiple workers: set worker_urls (one URL per worker) so the agent routes by session_id.
-      # Example: worker_urls: ["http://host:8001", "http://host:8002"]
       judge:
         enabled: true
-        judge_model_name: "gemini-3-pro-preview"
-        gcp_project_id: "nv-nemoposttrai-20250715184023"
-        gcp_location: "global"
+        judge_model_name: gemini-3-pro-preview
+        gcp_project_id: nv-nemoposttrai-20250715184023
+        gcp_location: global
         num_trials: 4
         max_concurrent_judgements: 10
         committee_models:
-          - name: "Qwen3-235B-A22B-Thinking-2507"
-            output_dir: "/path/to/precomputed/Qwen3-235B"
+        - name: Qwen3-235B-A22B-Thinking-2507
+          output_dir: /path/to/precomputed/Qwen3-235B
+      verified: false
 bash_sandbox_agent:
   responses_api_agents:
     gdpval_agent:

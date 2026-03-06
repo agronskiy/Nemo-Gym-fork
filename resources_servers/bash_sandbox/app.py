@@ -27,7 +27,9 @@ from typing import Dict, List
 import anyio
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
-from tavily import TavilyClient
+# tavily is imported lazily inside _get_tavily_client() rather than at module level so
+# that servers which import from this module (e.g. gdpval_agent) do not require
+# tavily-python in their own virtual environments.
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -652,6 +654,8 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         )
 
     def _get_tavily_client(self):
+        from tavily import TavilyClient  # lazy import — see module-level comment
+
         api_key = os.getenv("TAVILY_API_KEY")
         if not api_key:
             raise ValueError("TAVILY_API_KEY environment variable not set")

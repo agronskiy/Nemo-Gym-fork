@@ -13,6 +13,10 @@ bash_sandbox_resources_server:
         committee_models:
           - name: Qwen3-235B-A22B-Thinking-2507
             output_dir: /path/to/precomputed/Qwen3-235B
+        # OpenAI-compatible path — mutually exclusive with the VertexAI path (gcp_project_id).
+        # Set both fields to use the NVIDIA OpenAI endpoint; omit both to use VertexAI.
+        # nvidia_openai_api_key: "sk-..."
+        # nvidia_openai_model: "gcp/google/gemini-3-pro-preview"
       verified: false
 bash_sandbox_agent:
   responses_api_agents:

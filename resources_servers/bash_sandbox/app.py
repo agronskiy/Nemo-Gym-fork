@@ -26,7 +26,7 @@ from typing import Dict, List
 
 import anyio
 from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 # tavily is imported lazily inside _get_tavily_client() rather than at module level so
 # that servers which import from this module (e.g. gdpval_agent) do not require
 # tavily-python in their own virtual environments.
@@ -124,6 +124,18 @@ class JudgeConfig(BaseModel):
     num_trials: int = 4
     max_concurrent_judgements: int = 10
     committee_models: List[CommitteeModelConfig] = Field(default_factory=list)
+    nvidia_openai_api_key: str | None = None
+    nvidia_openai_model: str | None = None
+
+    @model_validator(mode="after")
+    def _check_openai_fields(self) -> "JudgeConfig":
+        has_key = bool(self.nvidia_openai_api_key)
+        has_model = bool(self.nvidia_openai_model)
+        if has_key != has_model:
+            raise ValueError(
+                "nvidia_openai_api_key and nvidia_openai_model must both be set or both be absent"
+            )
+        return self
 
 
 class BashSandboxResourcesServerConfig(BaseResourcesServerConfig):
@@ -748,6 +760,8 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                 max_output_tokens=judge_config.max_output_tokens,
                 num_trials=judge_config.num_trials,
                 max_concurrent_judgements=judge_config.max_concurrent_judgements,
+                nvidia_openai_api_key=judge_config.nvidia_openai_api_key,
+                nvidia_openai_model=judge_config.nvidia_openai_model,
             )
         return self._judge
 

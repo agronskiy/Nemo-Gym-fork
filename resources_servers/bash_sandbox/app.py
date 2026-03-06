@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import json
 import logging
 import os
 import re
@@ -39,6 +40,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from resources_servers.bash_sandbox.preconvert_to_pdf import OFFICE_EXTS, convert_one
 
 
 logger = logging.getLogger(__name__)
@@ -642,6 +644,31 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             result = await self.save_output_files(
                 SaveOutputFilesRequest(paths=body.paths, session_id=body.session_id, output_dir=body.output_dir)
             )
+
+            # Convert any office files saved by the model to PDF so the judge can read them.
+            # Must happen before /verify is called (judging is inline, not a separate offline phase).
+            loop = asyncio.get_running_loop()
+            try:
+                for saved_file in result.saved:
+                    out_path = Path(saved_file.output_path)
+                    if out_path.suffix.lower() in OFFICE_EXTS:
+                        out_pdf = out_path.with_suffix(".pdf")
+                        if not out_pdf.exists():
+                            _, ok, err = await loop.run_in_executor(
+                                None, convert_one, out_path, out_pdf
+                            )
+                            if not ok:
+                                logger.warning("PDF conversion failed for %s: %s", out_path, err)
+            except Exception as e:
+                logger.warning("PDF pre-conversion error in finish(): %s", e)
+
+            # Write finish_params.json sentinel so the judge treats this directory as
+            # "task was attempted" when comparing against committee model outputs.
+            try:
+                sentinel = Path(body.output_dir) / "finish_params.json"
+                sentinel.write_text(json.dumps({"paths": body.paths}))
+            except Exception as e:
+                logger.warning("Could not write finish_params.json to %s: %s", body.output_dir, e)
         else:
             result = SaveOutputFilesResponse(saved=[], failed={})
 

@@ -27,7 +27,7 @@ from typing import Dict, List
 
 import anyio
 from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 # tavily is imported lazily inside _get_tavily_client() rather than at module level so
 # that servers which import from this module (e.g. gdpval_agent) do not require
 # tavily-python in their own virtual environments.
@@ -126,12 +126,12 @@ class JudgeConfig(BaseModel):
     num_trials: int = 4
     max_concurrent_judgements: int = 10
     committee_models: List[CommitteeModelConfig] = Field(default_factory=list)
-    nvidia_openai_api_key: str | None = None
+    nvidia_openai_api_key_env: str | None = None
     nvidia_openai_model: str | None = None
 
     @model_validator(mode="after")
     def _check_openai_fields(self) -> "JudgeConfig":
-        has_key = bool(self.nvidia_openai_api_key)
+        has_key = bool(self.nvidia_openai_api_key_env)
         has_model = bool(self.nvidia_openai_model)
         if has_key != has_model:
             raise ValueError(
@@ -186,6 +186,13 @@ class SaveOutputFilesRequest(BaseModel):
     session_id: str
     output_dir: str
 
+    @field_validator("paths", mode="before")
+    @classmethod
+    def _coerce_paths(cls, v):
+        if isinstance(v, str):
+            return json.loads(v)
+        return v
+
 
 class SaveOutputFilesResponse(BaseModel):
     saved: List[SavedFile]
@@ -197,6 +204,13 @@ class FinishRequest(BaseModel):
     session_id: str
     paths: List[str] | None = None
     output_dir: str | None = None
+
+    @field_validator("paths", mode="before")
+    @classmethod
+    def _coerce_paths(cls, v):
+        if isinstance(v, str):
+            return json.loads(v)
+        return v
 
 
 class FinishResponse(BaseModel):
@@ -231,6 +245,7 @@ class VerifyRequest(BaseVerifyRequest):
     paths: List[str]
     task_id: str = ""
     task_prompt: str = ""
+    output_dir: str | None = None
 
 
 class CommitteeModelVerdict(BaseModel):
@@ -787,25 +802,38 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                 max_output_tokens=judge_config.max_output_tokens,
                 num_trials=judge_config.num_trials,
                 max_concurrent_judgements=judge_config.max_concurrent_judgements,
-                nvidia_openai_api_key=judge_config.nvidia_openai_api_key,
+                nvidia_openai_api_key=os.environ.get(judge_config.nvidia_openai_api_key_env) if judge_config.nvidia_openai_api_key_env else None,
                 nvidia_openai_model=judge_config.nvidia_openai_model,
             )
         return self._judge
 
-    async def verify(self, body: VerifyRequest) -> BaseVerifyResponse:
+    async def verify(self, body: VerifyRequest) -> GDPValVerifyResponse:
         judge_config = self.config.judge
+
+        logger.warning(
+            "verify: task_id=%r enabled=%r committee_models=%r paths=%r",
+            body.task_id,
+            judge_config.enabled,
+            [cm.output_dir for cm in judge_config.committee_models],
+            body.paths,
+        )
 
         # Backward compatible: if judge not enabled or no committee models, return reward=1.0
         if not judge_config.enabled or not judge_config.committee_models:
+            logger.warning("verify: judge disabled or no committee models, returning reward=1.0")
             return GDPValVerifyResponse(**body.model_dump(), reward=1.0)
 
         judge = self._get_or_create_judge()
 
-        # Determine evaluated output dir from the first saved file path
+        # Determine evaluated output dir: prefer first saved file's parent, fall back to output_dir.
+        # When the model saved no files, output_dir is still set so the judge can compare
+        # against the committee model (empty output → committee wins → reward=0).
         if body.paths:
             evaluated_output_dir = str(Path(body.paths[0]).parent)
+        elif body.output_dir:
+            evaluated_output_dir = body.output_dir
         else:
-            logger.warning("No output paths in verify request, returning reward=1.0")
+            logger.warning("No output paths or output_dir in verify request, returning reward=1.0")
             return GDPValVerifyResponse(**body.model_dump(), reward=1.0)
 
         # Find reference files directory: check if reference_files/ exists in evaluated output
@@ -820,6 +848,14 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         for cm in judge_config.committee_models:
             cm_task_dir = Path(cm.output_dir) / f"task_{body.task_id}"
             finish_params = cm_task_dir / "finish_params.json"
+
+            logger.info(
+                "verify: committee=%r cm_task_dir=%r exists=%r finish_params_exists=%r",
+                cm.name,
+                str(cm_task_dir),
+                cm_task_dir.exists(),
+                finish_params.exists(),
+            )
 
             # H7: Skip committee models that didn't attempt this task
             if not cm_task_dir.exists() or not finish_params.exists():

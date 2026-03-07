@@ -568,6 +568,7 @@ class GDPValAgent(SimpleResponsesAPIAgent):
             "output_files": output_files_serializable,
             "session_id": body.session_id or "",
             "paths": [str(f.output_path) for f in saved_files],
+            "output_dir": str(body.task_dir),
         }
 
         verify_response = await self.server_client.post(

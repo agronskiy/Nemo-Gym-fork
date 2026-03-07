@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import logging
 import os
 import urllib.request
 import uuid
@@ -53,8 +54,20 @@ from resources_servers.bash_sandbox.app import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 FINISH_TOOL_NAME = "finish"
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "gdpval_user_prompt.txt"
+
+# Files written by infrastructure/sentinels; excluded when enumerating task outputs on resume
+_RESUME_SKIP_NAMES = frozenset({"finish_params.json", "reward.json", "history.json", "metadata.json", "log.txt"})
+
+
+def _task_dir_for(body: "GDPValAgentRunRequest") -> Path:
+    name = f"task_{body.task_id}"
+    if body.repeat_index is not None:
+        name += f"_r{body.repeat_index}"
+    return Path(body.output_dir) / name
 MESSAGE_SUMMARIZER_PATH = Path(__file__).parent / "prompts" / "message_summarizer.txt"
 MESSAGE_SUMMARIZER_BRIDGE_PATH = Path(__file__).parent / "prompts" / "message_summarizer_bridge.txt"
 MESSAGE_SUMMARIZER = MESSAGE_SUMMARIZER_PATH.read_text()
@@ -95,6 +108,7 @@ class GDPValAgentRunRequest(BaseRunRequest):
     task_id: str | None = None
     session_id: str | None = None
     task_dir: Path | None = None
+    repeat_index: int | None = None
 
 
 class GDPValAgentVerifyRequest(BaseVerifyRequest):
@@ -420,13 +434,16 @@ class GDPValAgent(SimpleResponsesAPIAgent):
         #    whole conversation (avoids run() and responses() being on different agent workers).
         if body.session_id is None:
             if body.task_dir is None:
-                body.task_dir = Path(body.output_dir).joinpath(f"task_{body.task_id}")
+                body.task_dir = _task_dir_for(body)
             body.task_dir.mkdir(parents=True, exist_ok=True)
-            session_id = body.task_id or str(uuid.uuid4())
+            if body.task_id and body.repeat_index is not None:
+                session_id = f"{body.task_id}_r{body.repeat_index}"
+            else:
+                session_id = body.task_id or str(uuid.uuid4())
             seed_session_response = await self.server_client.post(
                 server_name=self.config.resources_server.name,
                 url_path="/seed_session",
-                json=SeedSessionRequest(session_id=session_id).model_dump(),
+                json=SeedSessionRequest(session_id=session_id, repeat_index=body.repeat_index).model_dump(),
                 cookies=cookies.resources_server,
                 affinity_key=session_id,
             )
@@ -438,7 +455,7 @@ class GDPValAgent(SimpleResponsesAPIAgent):
         # 2. Prepare reference files (download + upload to sandbox) only if not already uploaded.
         if not body.uploaded_reference_files:
             if body.task_dir is None:
-                body.task_dir = Path(body.output_dir).joinpath(f"task_{body.task_id}")
+                body.task_dir = _task_dir_for(body)
             body.task_dir.mkdir(parents=True, exist_ok=True)
             uploaded_reference_files, cookies = await self.prepare_reference_files(body, cookies)
             if uploaded_reference_files:
@@ -522,20 +539,38 @@ class GDPValAgent(SimpleResponsesAPIAgent):
         # Session is created inside responses() so the same handler (and thus same
         # agent worker) owns the session for the whole conversation.
         if body.task_dir is None:
-            body.task_dir = Path(body.output_dir).joinpath(f"task_{body.task_id}")
+            body.task_dir = _task_dir_for(body)
         body.task_dir.mkdir(parents=True, exist_ok=True)
 
-        # Execute the task by calling the self.responses endpoint
-        response = await self.server_client.post(
-            server_name=self.config.name,
-            url_path="/v1/responses",
-            json=body.model_dump(mode="json"),
-            cookies=cookies.resources_server,
-        )
-        await raise_for_status(response)
-        response_json = await get_response_json(response)
-        cookies = response.cookies
-        body.session_id = response_json.get("session_id") or body.session_id
+        reward_sentinel = body.task_dir / "reward.json"
+        finish_sentinel = body.task_dir / "finish_params.json"
+
+        # Fully done: return cached result without calling /v1/responses or /verify
+        if reward_sentinel.exists():
+            logger.info("Task %s (repeat=%s) already verified, skipping", body.task_id, body.repeat_index)
+            return GDPValAgentVerifyResponse.model_validate_json(reward_sentinel.read_text())
+
+        if finish_sentinel.exists():
+            # Agent done but not verified: synthesize response_json from existing files, skip to /verify
+            logger.info("Task %s (repeat=%s) agent done, skipping to verify", body.task_id, body.repeat_index)
+            existing_files = [
+                SavedFile(source_path=str(p), output_path=p, size=p.stat().st_size)
+                for p in body.task_dir.iterdir()
+                if p.is_file() and p.name not in _RESUME_SKIP_NAMES
+            ]
+            response_json = {"saved_files": [f.model_dump(mode="json") for f in existing_files], "output": []}
+        else:
+            # Normal path: call /v1/responses to run the agent
+            response = await self.server_client.post(
+                server_name=self.config.name,
+                url_path="/v1/responses",
+                json=body.model_dump(mode="json"),
+                cookies=cookies.resources_server,
+            )
+            await raise_for_status(response)
+            response_json = await get_response_json(response)
+            cookies = response.cookies
+            body.session_id = response_json.get("session_id") or body.session_id
 
         # Extract saved files from the agent response
         saved_files = []
@@ -581,7 +616,7 @@ class GDPValAgent(SimpleResponsesAPIAgent):
         await raise_for_status(verify_response)
         verify_json = await get_response_json(verify_response)
 
-        return GDPValAgentVerifyResponse(
+        result = GDPValAgentVerifyResponse(
             responses_create_params=body.responses_create_params.model_dump(),
             response={
                 "id": "placeholder",
@@ -598,6 +633,10 @@ class GDPValAgent(SimpleResponsesAPIAgent):
             output_files=saved_files,
             committee_verdicts=verify_json.get("committee_verdicts", []),
         )
+
+        # Write verify sentinel so future runs can skip directly to return
+        reward_sentinel.write_text(result.model_dump_json())
+        return result
 
 
 if __name__ == "__main__":

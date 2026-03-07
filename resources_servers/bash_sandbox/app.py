@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import anyio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 # tavily is imported lazily inside _get_tavily_client() rather than at module level so
 # that servers which import from this module (e.g. gdpval_agent) do not require
@@ -148,6 +148,7 @@ class BashSandboxResourcesServerConfig(BaseResourcesServerConfig):
 
 class SeedSessionRequest(BaseSeedSessionRequest):
     session_id: str | None = None
+    repeat_index: int | None = None
 
 
 class SeedSessionResponse(BaseSeedSessionResponse):
@@ -390,6 +391,11 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         return None
 
     async def seed_session(self, body: SeedSessionRequest) -> SeedSessionResponse:
+        if body.repeat_index is not None and not self.config.judge.enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="num_repeats > 1 is not allowed when judge is disabled (calibration runs must be single-repeat)",
+            )
         if body.session_id is None:
             session_id = str(uuid.uuid4())
         else:

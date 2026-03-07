@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from tqdm.asyncio import tqdm
 
 from nemo_gym.config_types import BaseNeMoGymCLIConfig, BaseServerConfig
-from nemo_gym.global_config import TASK_INDEX_KEY_NAME
+from nemo_gym.global_config import REPEAT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.server_utils import (
     GlobalAIOHTTPAsyncClientConfig,
     ServerClient,
@@ -93,8 +93,11 @@ class RolloutCollectionHelper(BaseModel):  # pragma: no cover
             previous_length = len(rows)
             expanded = []
             for task_idx, row in enumerate(rows):
-                for _ in range(config.num_repeats):
-                    expanded.append({**row, TASK_INDEX_KEY_NAME: task_idx})
+                for repeat_idx in range(config.num_repeats):
+                    new_row = {**row, TASK_INDEX_KEY_NAME: task_idx}
+                    if config.num_repeats > 1:
+                        new_row[REPEAT_INDEX_KEY_NAME] = repeat_idx
+                    expanded.append(new_row)
             rows = expanded
             print(f"Repeating rows (in a pattern of abc to aabbcc) from {previous_length} to {len(rows)}!")
 
@@ -137,6 +140,8 @@ class RolloutCollectionHelper(BaseModel):  # pragma: no cover
                     # For ng_profile to match rollouts to tasks
                     if TASK_INDEX_KEY_NAME in row:
                         result[TASK_INDEX_KEY_NAME] = row[TASK_INDEX_KEY_NAME]
+                    if REPEAT_INDEX_KEY_NAME in row:
+                        result[REPEAT_INDEX_KEY_NAME] = row[REPEAT_INDEX_KEY_NAME]
                     f.write(json.dumps(result, indent=2) + "\n")
 
             await tqdm.gather(*map(_post_coroutine, rows), desc="Collecting rollouts", miniters=tqdm_miniters)

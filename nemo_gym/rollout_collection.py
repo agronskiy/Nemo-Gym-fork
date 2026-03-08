@@ -126,7 +126,7 @@ class RolloutCollectionHelper(BaseModel):  # pragma: no cover
 
         metrics = Counter()
         Path(config.output_jsonl_fpath).parent.mkdir(exist_ok=True, parents=True)
-        with open(config.output_jsonl_fpath, "a") as f:
+        with open(config.output_jsonl_fpath, "w") as f:
 
             async def _post_coroutine(row: dict) -> None:
                 row["responses_create_params"] = row["responses_create_params"] | config.responses_create_params

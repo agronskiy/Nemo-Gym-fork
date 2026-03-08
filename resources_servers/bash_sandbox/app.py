@@ -926,8 +926,11 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                 finish_params.exists(),
             )
 
-            # H7: Skip committee models that didn't attempt this task
-            if not cm_task_dir.exists() or not finish_params.exists():
+            # H7: Skip committee models that didn't attempt this task.
+            # Accept either finish_params.json (explicit finish call) or reward.json
+            # (task ran to completion even if LLM exhausted max_steps without calling finish).
+            reward_json = cm_task_dir / "reward.json"
+            if not cm_task_dir.exists() or (not finish_params.exists() and not reward_json.exists()):
                 logger.warning(
                     "Committee model %s has no output for task %s, skipping",
                     cm.name,

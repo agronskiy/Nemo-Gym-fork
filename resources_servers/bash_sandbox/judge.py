@@ -29,6 +29,7 @@ Key differences from stirrup:
 import asyncio
 import base64
 import logging
+import math
 import os
 import re
 import shutil
@@ -162,6 +163,21 @@ FILE_TYPE_MAP = {
     "sol": {"type": "TXT", "converter": load_raw_text, "mime_type": None},
     "ts": {"type": "TXT", "converter": load_raw_text, "mime_type": None},
 }
+
+
+# --- ELO formula ---
+
+
+def calculate_elo(win_rate: float, ref_elo: float) -> float:
+    """ELO rating for evaluated model relative to a reference committee model.
+
+    Adapted from stirrup's calculate_ELO (run_judge.py:154-158). Drops normalized_elo
+    (raw ELO is more interpretable). win_rate clamped to avoid log(0).
+    Uses Bradley-Terry win_rate (wins + 0.5*ties)/total — differs from stirrup which
+    excludes ties from numerator.
+    """
+    win_rate = max(1e-6, min(1 - 1e-6, win_rate))
+    return ref_elo - 400.0 * (math.log10(1 - win_rate) - math.log10(win_rate))
 
 
 # --- Result dataclass ---

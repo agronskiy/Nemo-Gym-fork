@@ -15,12 +15,14 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import uuid
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from typing import Dict, List
@@ -111,6 +113,38 @@ class SavedFile(BaseModel):
     size: int
 
 
+def _calculate_elo(win_rate: float, ref_elo: float) -> float:
+    """ELO for evaluated model vs reference committee model.
+
+    Inlined from judge.calculate_elo to avoid importing judge.py at startup
+    (judge.py triggers google-genai/openai imports even when judge is disabled).
+    """
+    win_rate = max(1e-6, min(1 - 1e-6, win_rate))
+    return ref_elo - 400.0 * (math.log10(1 - win_rate) - math.log10(win_rate))
+
+
+@dataclass
+class _CommitteeModelTally:
+    """Accumulated win/tie/loss counts across all verify() calls for one committee model."""
+
+    win_count_evaluated: int = 0
+    win_count_committee: int = 0
+    tie_count: int = 0
+    num_successful_tasks: int = 0
+
+    @property
+    def win_rate(self) -> float:
+        total = self.win_count_evaluated + self.win_count_committee + self.tie_count
+        if total == 0:
+            return 0.5
+        return (self.win_count_evaluated + 0.5 * self.tie_count) / total
+
+
+class CommitteeModelConfig(BaseModel):
+    name: str
+    elo: float = 1000.0
+
+
 class JudgeConfig(BaseModel):
     enabled: bool = False
     judge_model_name: str = "gemini-3-pro-preview"
@@ -121,7 +155,8 @@ class JudgeConfig(BaseModel):
     num_trials: int = 4
     max_concurrent_judgements: int = 10
     committee_models_root: str = ""
-    committee_models: List[str] = Field(default_factory=list)
+    evaluated_outputs_root: str = ""
+    committee_models: List[CommitteeModelConfig] = Field(default_factory=list)
     nvidia_openai_api_key_env: str | None = None
     nvidia_openai_model: str | None = None
 
@@ -141,8 +176,8 @@ class JudgeConfig(BaseModel):
             root = Path(self.committee_models_root)
             if not root.is_dir():
                 raise ValueError(f"committee_models_root {root!r} does not exist or is not a directory")
-            for name in self.committee_models:
-                model_dir = root / name
+            for cm in self.committee_models:
+                model_dir = root / cm.name
                 if not model_dir.is_dir():
                     raise ValueError(f"Committee model directory {model_dir!r} does not exist")
         return self
@@ -264,12 +299,28 @@ class CommitteeModelVerdict(BaseModel):
     tie_count: int
     num_trials: int
     reward: float
+    elo: float | None = None
     success: bool
     error_message: str | None = None
 
 
 class GDPValVerifyResponse(BaseVerifyResponse):
     committee_verdicts: List[CommitteeModelVerdict] = Field(default_factory=list)
+    mean_elo: float | None = None
+
+
+class CommitteeEloEntry(BaseModel):
+    committee_model_name: str
+    elo: float | None  # None if no successful tasks yet
+    ref_elo: float
+    win_count_evaluated: int
+    win_count_committee: int
+    tie_count: int
+    num_successful_tasks: int
+
+
+class CommitteeEloResponse(BaseModel):
+    entries: List[CommitteeEloEntry]
 
 
 class BashSandboxResourcesServer(SimpleResourcesServer):
@@ -278,10 +329,13 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
     config: BashSandboxResourcesServerConfig
     session_manager: SessionManager = None  # type: ignore[assignment]
     _judge: object = None  # Lazily initialized GDPValJudge
+    _committee_tallies: dict = None  # type: ignore[assignment]  # per-worker; not shared across Ray workers
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.session_manager = SessionManager(Path(self.config.temp_dir_base))
+        self._committee_tallies = {}
+        self._load_tallies_from_disk()
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -294,6 +348,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         app.post("/finish")(self.finish)  # Finish tool for task completion
         app.post("/web_search")(self.web_search)
         app.post("/web_fetch")(self.web_fetch)
+        app.get("/committee_elo")(self.committee_elo)
 
         return app
 
@@ -859,13 +914,13 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         # Build judge tasks for each committee model
         judge_tasks = []
         committee_configs = []
-        for cm_name in judge_config.committee_models:
-            cm_task_dir = Path(judge_config.committee_models_root) / cm_name / f"task_{body.task_id}"
+        for cm in judge_config.committee_models:
+            cm_task_dir = Path(judge_config.committee_models_root) / cm.name / f"task_{body.task_id}"
             finish_params = cm_task_dir / "finish_params.json"
 
             logger.info(
                 "verify: committee=%r cm_task_dir=%r exists=%r finish_params_exists=%r",
-                cm_name,
+                cm.name,
                 str(cm_task_dir),
                 cm_task_dir.exists(),
                 finish_params.exists(),
@@ -875,7 +930,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             if not cm_task_dir.exists() or not finish_params.exists():
                 logger.warning(
                     "Committee model %s has no output for task %s, skipping",
-                    cm_name,
+                    cm.name,
                     body.task_id,
                 )
                 continue
@@ -892,10 +947,10 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                     evaluated_output_dir=evaluated_output_dir,
                     committee_output_dir=str(cm_task_dir),
                     refs_dir=refs_dir,
-                    committee_model_name=cm_name,
+                    committee_model_name=cm.name,
                 )
             )
-            committee_configs.append(cm_name)
+            committee_configs.append(cm)
 
         # H7: If no committee models have output for this task, fall back to reward=1.0
         if not judge_tasks:
@@ -908,24 +963,29 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         # Build verdicts and compute mean reward
         committee_verdicts = []
         successful_rewards = []
+        successful_elos = []
 
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error("Judge task for %s raised exception: %s", committee_configs[i], result)
+                logger.error("Judge task for %s raised exception: %s", committee_configs[i].name, result)
                 committee_verdicts.append(
                     CommitteeModelVerdict(
-                        committee_model_name=committee_configs[i],
+                        committee_model_name=committee_configs[i].name,
                         win_count_evaluated=0,
                         win_count_committee=0,
                         tie_count=0,
                         num_trials=0,
                         reward=0.0,
+                        elo=None,
                         success=False,
                         error_message=str(result),
                     )
                 )
                 continue
 
+            # Gate ELO on result.success: graceful failures have win_rate=0.5 (default guard),
+            # which would produce a misleading ref_elo value
+            elo = _calculate_elo(result.win_rate, committee_configs[i].elo) if result.success else None
             verdict = CommitteeModelVerdict(
                 committee_model_name=result.committee_model_name,
                 win_count_evaluated=result.win_count_evaluated,
@@ -933,6 +993,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                 tie_count=result.tie_count,
                 num_trials=result.num_trials,
                 reward=result.reward,
+                elo=elo,
                 success=result.success,
                 error_message=result.error_message,
             )
@@ -941,6 +1002,15 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
             # H6: Only include successful verdicts in the mean
             if result.success:
                 successful_rewards.append(result.reward)
+                successful_elos.append(elo)
+                # Update aggregate tally for this committee model
+                tally = self._committee_tallies.setdefault(
+                    result.committee_model_name, _CommitteeModelTally()
+                )
+                tally.win_count_evaluated += result.win_count_evaluated
+                tally.win_count_committee += result.win_count_committee
+                tally.tie_count += result.tie_count
+                tally.num_successful_tasks += 1
 
         # H6: If ALL verdicts fail, fall back to reward=1.0
         if not successful_rewards:
@@ -949,11 +1019,67 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         else:
             mean_reward = sum(successful_rewards) / len(successful_rewards)
 
+        mean_elo = sum(successful_elos) / len(successful_elos) if successful_elos else None
+
         return GDPValVerifyResponse(
             **body.model_dump(),
             reward=mean_reward,
             committee_verdicts=committee_verdicts,
+            mean_elo=mean_elo,
         )
+
+
+    def _load_tallies_from_disk(self) -> None:
+        """Reconstruct tallies from reward.json files on disk for autoresume support.
+
+        reward.json already contains committee_verdicts (written by gdpval_agent after verify
+        succeeds). Scanning these files on startup avoids double-counting: if the server crashed
+        mid-verify, no reward.json exists → task will be re-verified → tally updated once.
+        """
+        judge_config = self.config.judge
+        if not judge_config.enabled or not judge_config.evaluated_outputs_root:
+            return
+        root = Path(judge_config.evaluated_outputs_root)
+        for reward_file in root.glob("task_*/reward.json"):
+            try:
+                data = json.loads(reward_file.read_text())
+                for verdict_dict in data.get("committee_verdicts", []):
+                    verdict = CommitteeModelVerdict.model_validate(verdict_dict)
+                    if not verdict.success:
+                        continue
+                    tally = self._committee_tallies.setdefault(
+                        verdict.committee_model_name, _CommitteeModelTally()
+                    )
+                    tally.win_count_evaluated += verdict.win_count_evaluated
+                    tally.win_count_committee += verdict.win_count_committee
+                    tally.tie_count += verdict.tie_count
+                    tally.num_successful_tasks += 1
+            except Exception:
+                logger.warning("Failed to load tallies from %s, skipping", reward_file)
+
+    async def committee_elo(self) -> CommitteeEloResponse:
+        """Return aggregate ELO across all verify() calls since server start.
+
+        NOTE: tallies are per-worker — in multi-worker Ray deployments this endpoint
+        only reflects tasks processed by the responding worker, not a global aggregate.
+        """
+        cm_config_by_name = {cm.name: cm for cm in self.config.judge.committee_models}
+        entries = []
+        for name, tally in self._committee_tallies.items():
+            ref_elo = cm_config_by_name[name].elo if name in cm_config_by_name else 1000.0
+            elo = _calculate_elo(tally.win_rate, ref_elo) if tally.num_successful_tasks > 0 else None
+            entries.append(
+                CommitteeEloEntry(
+                    committee_model_name=name,
+                    elo=elo,
+                    ref_elo=ref_elo,
+                    win_count_evaluated=tally.win_count_evaluated,
+                    win_count_committee=tally.win_count_committee,
+                    tie_count=tally.tie_count,
+                    num_successful_tasks=tally.num_successful_tasks,
+                )
+            )
+        return CommitteeEloResponse(entries=entries)
 
 
 if __name__ == "__main__":

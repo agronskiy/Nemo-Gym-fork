@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import re
 from copy import deepcopy
 from time import time
@@ -57,6 +58,9 @@ from nemo_gym.openai_utils import (
     TokenIDLogProbMixin,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_worker
+
+
+logger = logging.getLogger(__name__)
 
 
 class VLLMModelConfig(BaseResponsesAPIModelConfig):
@@ -270,6 +274,11 @@ class VLLMModel(SimpleResponsesAPIModel):
                     ],
                 )
             else:
+                logger.error(
+                    "Unexpected %d from model — body: %s",
+                    e.status,
+                    result_content_str,
+                )
                 raise e
 
         choice_dict = chat_completion_dict["choices"][0]

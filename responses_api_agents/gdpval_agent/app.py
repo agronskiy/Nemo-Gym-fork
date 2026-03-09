@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import List
 from urllib.parse import quote
 
-from fastapi import Request, Response
+import anyio
+from fastapi import HTTPException, Request, Response
 from openai.types.responses.response_usage import ResponseUsage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -56,6 +57,16 @@ from resources_servers.bash_sandbox.app import (
 
 
 logger = logging.getLogger(__name__)
+
+TASK_TIMEOUT = 60 * 15  # 15 minutes — cap on the /v1/responses agent loop
+
+MAX_TOOL_OUTPUT_CHARS = 20_000
+
+
+def _estimate_input_tokens(messages: list) -> int:
+    """Rough token estimate: 4 chars per token, based on JSON-serialised message text."""
+    return sum(len(m.model_dump_json()) for m in messages) // 4
+
 
 FINISH_TOOL_NAME = "finish"
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "gdpval_user_prompt.txt"
@@ -291,10 +302,17 @@ class GDPValAgent(SimpleResponsesAPIAgent):
         )
         cookies.resources_server = api_response.cookies
 
+        raw_output = (await api_response.content.read()).decode()
+        if len(raw_output) > MAX_TOOL_OUTPUT_CHARS:
+            raw_output = (
+                raw_output[:MAX_TOOL_OUTPUT_CHARS]
+                + f"\n[...output truncated at {MAX_TOOL_OUTPUT_CHARS} chars; "
+                f"total output was {len(raw_output)} chars. Use head/tail or redirect to a file to avoid truncation...]"
+            )
         tool_response = NeMoGymFunctionCallOutput(
             type="function_call_output",
             call_id=call.call_id,
-            output=(await api_response.content.read()).decode(),
+            output=raw_output,
         )
 
         return tool_response, cookies
@@ -506,16 +524,15 @@ class GDPValAgent(SimpleResponsesAPIAgent):
                 break
 
             if summary_cutoff is not None and step_num < max_steps - 1:
-                if usage is None:
-                    logger.warning(
-                        "usage is None — context summarization skipped (model server may not be returning usage)"
-                    )
-                elif usage.total_tokens and usage.total_tokens / self.config.context_window_tokens >= summary_cutoff:
-                    total_tokens = usage.total_tokens
-                    pct_used = total_tokens / self.config.context_window_tokens
+                estimated = _estimate_input_tokens(model_params.input)
+                usage_total = usage.total_tokens if usage is not None else 0
+                max_seen = max(estimated, usage_total)
+                if max_seen / self.config.context_window_tokens >= summary_cutoff:
+                    pct_used = max_seen / self.config.context_window_tokens
                     print(
                         f"Context at {pct_used:.1%} of context_window_tokens "
-                        f"({total_tokens}/{self.config.context_window_tokens}). Summarizing..."
+                        f"(char-estimate={estimated}, usage={usage_total}, "
+                        f"limit={self.config.context_window_tokens}). Summarizing..."
                     )
                     condensed_input, cookies = await self.summarize_messages(
                         model_params.input, model_params, cookies, n_task_context
@@ -554,6 +571,13 @@ class GDPValAgent(SimpleResponsesAPIAgent):
 
         reward_sentinel = body.task_dir / "reward.json"
         finish_sentinel = body.task_dir / "finish_params.json"
+        timeout_sentinel = body.task_dir / "timeout.json"
+
+        if timeout_sentinel.exists():
+            logger.info(
+                "Task %s (repeat=%s) previously timed out, retrying from scratch",
+                body.task_id, body.repeat_index,
+            )
 
         # Fully done: return cached result without calling /v1/responses or /verify
         if reward_sentinel.exists():
@@ -575,18 +599,31 @@ class GDPValAgent(SimpleResponsesAPIAgent):
             response_json = {"saved_files": [f.model_dump(mode="json") for f in existing_files], "output": history_output}
         else:
             # Normal path: call /v1/responses to run the agent
-            response = await self.server_client.post(
-                server_name=self.config.name,
-                url_path="/v1/responses",
-                json=body.model_dump(mode="json"),
-                cookies=cookies.resources_server,
-            )
-            await raise_for_status(response)
-            response_json = await get_response_json(response)
-            cookies = response.cookies
-            body.session_id = response_json.get("session_id") or body.session_id
-            history_file = body.task_dir / "history.json"
-            history_file.write_text(json.dumps(response_json.get("output", [])))
+            try:
+                async with anyio.fail_after(TASK_TIMEOUT):
+                    response = await self.server_client.post(
+                        server_name=self.config.name,
+                        url_path="/v1/responses",
+                        json=body.model_dump(mode="json"),
+                        cookies=cookies.resources_server,
+                    )
+                    await raise_for_status(response)
+                    response_json = await get_response_json(response)
+                    cookies = response.cookies
+                    body.session_id = response_json.get("session_id") or body.session_id
+                    history_file = body.task_dir / "history.json"
+                    history_file.write_text(json.dumps(response_json.get("output", [])))
+            except TimeoutError:
+                logger.warning(
+                    "Task %s (repeat=%s) timed out after %ds",
+                    body.task_id, body.repeat_index, TASK_TIMEOUT,
+                )
+                timeout_sentinel.write_text(json.dumps({
+                    "task_id": body.task_id,
+                    "repeat_index": body.repeat_index,
+                    "timeout_seconds": TASK_TIMEOUT,
+                }))
+                raise HTTPException(status_code=408, detail=f"Task timed out after {TASK_TIMEOUT}s")
 
         # Extract saved files from the agent response
         saved_files = []

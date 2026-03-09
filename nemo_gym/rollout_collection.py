@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import json
+import logging
 from asyncio import Future, Semaphore
 from collections import Counter
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from itertools import repeat
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from aiohttp import ClientResponseError
 from pydantic import BaseModel, Field
 from tqdm.asyncio import tqdm
 
@@ -35,6 +37,9 @@ from nemo_gym.server_utils import (
     raise_for_status,
     set_global_aiohttp_client,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class RolloutCollectionConfig(BaseNeMoGymCLIConfig):
@@ -133,8 +138,17 @@ class RolloutCollectionHelper(BaseModel):  # pragma: no cover
                 # Use config.agent_name if specified, otherwise use agent_ref from the row
                 agent_name = config.agent_name or row.get("agent_ref", {}).get("name")
                 async with semaphore:
-                    response = await server_client.post(server_name=agent_name, url_path="/run", json=row)
-                    await raise_for_status(response)
+                    try:
+                        response = await server_client.post(server_name=agent_name, url_path="/run", json=row)
+                        await raise_for_status(response)
+                    except ClientResponseError as e:
+                        if e.status == 408:
+                            logger.warning(
+                                "Task timed out (row task_id=%s), skipping JSONL write",
+                                row.get("task_id"),
+                            )
+                            return
+                        raise
                     result = await get_response_json(response)
                     metrics.update({k: v for k, v in result.items() if isinstance(v, (int, float))})
                     # For ng_profile to match rollouts to tasks

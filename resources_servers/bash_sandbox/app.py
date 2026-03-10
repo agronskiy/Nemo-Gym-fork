@@ -123,6 +123,55 @@ def _calculate_elo(win_rate: float, ref_elo: float) -> float:
     return ref_elo - 400.0 * (math.log10(1 - win_rate) - math.log10(win_rate))
 
 
+def _fit_bradley_terry_elo(entries: "list[CommitteeEloEntry]") -> "float | None":
+    """Bradley-Terry MLE for evaluated model ELO, pooling all committee comparisons.
+
+    Excludes ties (per Bradley-Terry convention). Each committee model contributes
+    win_count_evaluated wins and win_count_committee losses for the evaluated model.
+    Solves dL/dx = 0 via bisection:
+
+        sum_i w_i  =  sum_i (w_i + l_i) * p_i(x)
+
+    where p_i(x) = 1 / (1 + 10^((ref_elo_i - x) / 400)).
+
+    Returns None if there are no valid comparisons (all counts zero).
+    """
+    comparisons = [
+        (e.win_count_evaluated, e.win_count_committee, e.ref_elo)
+        for e in entries
+        if e.win_count_evaluated + e.win_count_committee > 0
+    ]
+    if not comparisons:
+        return None
+
+    total_wins = sum(w for w, _l, _ in comparisons)
+
+    def mle_residual(x: float) -> float:
+        expected_wins = sum(
+            (w + l) / (1.0 + 10.0 ** ((ref - x) / 400.0))
+            for w, l, ref in comparisons
+        )
+        return total_wins - expected_wins
+
+    # mle_residual is monotone DECREASING in x (p_i(x) increases → expected_wins
+    # increases → residual = total_wins − expected_wins decreases).
+    # Bisect: find x where residual crosses zero from positive to negative.
+    lo, hi = -4000.0, 6000.0
+    # Guard: if evaluated never wins, residual ≤ 0 everywhere → clamp to lo
+    if mle_residual(lo) <= 0:
+        return lo
+    # Guard: if evaluated always wins, residual ≥ 0 everywhere → clamp to hi
+    if mle_residual(hi) >= 0:
+        return hi
+    for _ in range(64):  # 64 iterations → < 1e-15 ELO precision
+        mid = (lo + hi) / 2.0
+        if mle_residual(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
 @dataclass
 class _CommitteeModelTally:
     """Accumulated win/tie/loss counts across all verify() calls for one committee model."""
@@ -315,6 +364,7 @@ class CommitteeEloEntry(BaseModel):
 
 class CommitteeEloResponse(BaseModel):
     entries: List[CommitteeEloEntry]
+    final_elo: float | None = None  # Bradley-Terry MLE across all committee comparisons
 
 
 class BashSandboxResourcesServer(SimpleResourcesServer):
@@ -1065,7 +1115,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
                     num_successful_tasks=tally.num_successful_tasks,
                 )
             )
-        return CommitteeEloResponse(entries=entries)
+        return CommitteeEloResponse(entries=entries, final_elo=_fit_bradley_terry_elo(entries))
 
 
 if __name__ == "__main__":

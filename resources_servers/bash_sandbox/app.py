@@ -145,6 +145,7 @@ class _CommitteeModelTally:
 class CommitteeModelConfig(BaseModel):
     name: str
     elo: float = 1000.0
+    path: str  # absolute path to this model's output directory
 
 
 class JudgeConfig(BaseModel):
@@ -156,7 +157,6 @@ class JudgeConfig(BaseModel):
     max_output_tokens: int = 65535
     num_trials: int = 4
     max_concurrent_judgements: int = 10
-    committee_models_root: str = ""
     evaluated_outputs_root: str = ""
     committee_models: List[CommitteeModelConfig] = Field(default_factory=list)
     nvidia_openai_api_key_env: str | None = None
@@ -172,16 +172,10 @@ class JudgeConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_committee_models(self) -> "JudgeConfig":
-        if self.committee_models and not self.committee_models_root:
-            raise ValueError("committee_models_root must be set when committee_models is non-empty")
-        if self.committee_models_root:
-            root = Path(self.committee_models_root)
-            if not root.is_dir():
-                raise ValueError(f"committee_models_root {root!r} does not exist or is not a directory")
-            for cm in self.committee_models:
-                model_dir = root / cm.name
-                if not model_dir.is_dir():
-                    raise ValueError(f"Committee model directory {model_dir!r} does not exist")
+        for cm in self.committee_models:
+            model_dir = Path(cm.path)
+            if not model_dir.is_dir():
+                raise ValueError(f"Committee model path {model_dir!r} does not exist")
         return self
 
 
@@ -910,7 +904,7 @@ class BashSandboxResourcesServer(SimpleResourcesServer):
         judge_tasks = []
         committee_configs = []
         for cm in judge_config.committee_models:
-            cm_task_dir = Path(judge_config.committee_models_root) / cm.name / f"task_{body.task_id}"
+            cm_task_dir = Path(cm.path) / f"task_{body.task_id}"
             finish_params = cm_task_dir / "finish_params.json"
 
             logger.info(
